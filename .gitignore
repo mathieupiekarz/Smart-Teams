@@ -76,3 +76,8 @@ airflow.db*
 
 #exports des vues
 PowerBI/export_views/exports
+# Données client et fichiers générés (non versionnés)
+Inputs_Projets_NF26_AI07/
+*.pbix
+*.generated
+profiles.yml
