@@ -26,19 +26,7 @@ L'ensemble est orchestré par **Apache Airflow**, avec reprise automatique des j
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    A["Fichiers plats .txt<br/>(1 lot / jour)"] -->|"PUT → COPY INTO<br/>Python"| B[("STG<br/>staging")]
-    B -->|"dbt · table"| C[("WRK<br/>nettoyage")]
-    C -->|"dbt · incrémental"| D[("SOC<br/>socle historisé")]
-    D -->|"vues SQL"| E["Power BI<br/>6 KPI"]
-    F{{"Airflow DAG"}} -.orchestre.-> B
-    F -.orchestre.-> C
-    F -.orchestre.-> D
-    B -.trace.-> T[("TCH<br/>suivi d'exécution")]
-    C -.trace.-> T
-    D -.trace.-> T
-```
+![Architecture du pipeline : fichiers .txt → STG → WRK → SOC → Power BI, orchestré par Airflow et tracé dans TCH](docs/architecture.png)
 
 | Couche | Rôle | Implémentation |
 |---|---|---|
