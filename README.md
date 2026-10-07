@@ -1,266 +1,170 @@
-# Projet NF26 - Collaboration avec Smart Teem 
+# Entrepôt de données hospitalier — Snowflake · dbt · Airflow · Power BI
 
-Système d'information décisionnel hostpitalier. Workflow : ingestion fichiers plats STG → transformations dbt (WRK -> SOC) → Power BI.  
-Stack : Snowflake, dbt Core, Apache Airflow, Python (`uv`).
+Projet de fin de module **NF26 (UTC, 2026)** réalisé en partenariat avec **Smart Teem**, cabinet de conseil Data & IA.
 
-**Plateformes supportées :** Linux, macOS, Windows (PowerShell).
+L'objectif : construire de bout en bout le **système d'information décisionnel** d'un établissement de santé, depuis les fichiers plats quotidiens jusqu'aux tableaux de bord de pilotage.
 
-Toutes les commandes ci-dessous s'exécutent **depuis la racine du dépôt**, sauf indication contraire.
-
----
-
-## Contenu du livrable
-
-| Lot | Contenu | Dossiers / Fichiers |
-|-----|---------|---------------------|
-| **Lot 1** — Environnement + MPD | Modèles physiques de données + documentation | `MPD/`, `env_projet.md` |
-| **Lot 2** — Installation SID + Ingestion STG | Scripts de création des bases/tables + chargement STG | `SQL/`, `src/load_data.py` |
-| **Lot 3** — Alimentation DWH + Orchestration | Projet dbt, DAGs Airflow, scripts pipeline | `dbt_hopital/`, `dags/`, `src/`, `run_airflow.ps1`, `run_airflow.sh`, `pyproject.toml`, `uv.lock` |
-| **Lot 4** — Power BI | Vues SQL, exports CSV, dashboard | `PowerBI/` |
+![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)
+![Snowflake](https://img.shields.io/badge/Snowflake-29B5E8?logo=snowflake&logoColor=white)
+![dbt](https://img.shields.io/badge/dbt_Core-FF694B?logo=dbt&logoColor=white)
+![Airflow](https://img.shields.io/badge/Apache_Airflow-017CEE?logo=apacheairflow&logoColor=white)
+![Power BI](https://img.shields.io/badge/Power_BI-F2C811?logo=powerbi&logoColor=black)
 
 ---
 
-## Prérequis
+## Ce que fait le projet
 
-- [uv](https://docs.astral.sh/uv/) installé
-- Accès Snowflake (Compte projet, rôle `ACCOUNTADMIN`)
-- Données sources dans `Inputs_Projets_NF26_AI07/Data Hospital/` (ou chemin personnalisé avec positionnement de la variable d'environnement `STG_DATA_DIR`)
+Chaque jour, l'hôpital produit un lot de fichiers texte : chambres, patients, personnel, consultations, hospitalisations, médicaments, traitements. Le pipeline :
+
+1. **valide** que les fichiers du jour sont présents et complets ;
+2. les **charge** dans Snowflake (zone de staging `STG`), en historisant la veille ;
+3. les **transforme** avec dbt en deux couches : `WRK` (nettoyage) puis `SOC` (socle historisé, chargement incrémental) ;
+4. **trace** chaque exécution dans un schéma technique `TCH` (début, fin, statut, script) ;
+5. expose des **vues KPI** consommées par un tableau de bord Power BI.
+
+L'ensemble est orchestré par **Apache Airflow**, avec reprise automatique des jours en échec.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    A["Fichiers plats .txt<br/>(1 lot / jour)"] -->|"PUT → COPY INTO<br/>Python"| B[("STG<br/>staging")]
+    B -->|"dbt · table"| C[("WRK<br/>nettoyage")]
+    C -->|"dbt · incrémental"| D[("SOC<br/>socle historisé")]
+    D -->|"vues SQL"| E["Power BI<br/>6 KPI"]
+    F{{"Airflow DAG"}} -.orchestre.-> B
+    F -.orchestre.-> C
+    F -.orchestre.-> D
+    B -.trace.-> T[("TCH<br/>suivi d'exécution")]
+    C -.trace.-> T
+    D -.trace.-> T
+```
+
+| Couche | Rôle | Implémentation |
+|---|---|---|
+| **STG** | Copie brute du lot du jour, vidée et rechargée à chaque run | `src/load_data.py` (PUT → COPY INTO via un stage Snowflake) |
+| **WRK** | Typage et nettoyage, recalculé à chaque run | 10 modèles dbt, matérialisés en `table` |
+| **SOC** | Socle de données historisé : seules les nouvelles lignes sont ajoutées | 10 modèles dbt, matérialisés en `incremental` |
+| **TCH** | Journal technique de chaque exécution (Python et dbt) | Tables `T_SUIV_RUN` / `T_SUIV_TRMT`, macros dbt `start_tracking` / `end_tracking` |
+
+Les modèles physiques de données (MPD) des couches STG et SOC sont dans [`MPD/`](MPD/), au format DBML et PDF.
+
+## Tableau de bord
+
+Six indicateurs demandés par le client, calculés par des vues SQL sur la couche SOC ([`PowerBI/create_views/create_views.sql`](PowerBI/create_views/create_views.sql)), filtrables par période et par pathologie :
+
+| | |
+|---|---|
+| ![Âge moyen des patients par pathologie](docs/kpi1.png) | ![Médicaments les plus prescrits par pathologie](docs/kpi2.png) |
+| **KPI 1** — Âge moyen des patients par pathologie | **KPI 2** — Médicaments les plus prescrits par pathologie |
+| ![Chambres occupées par pathologie](docs/kpi3.png) | ![Répartition des médecins par spécialité](docs/kpi4.png) |
+| **KPI 3** — Chambres occupées par pathologie | **KPI 4** — Répartition des médecins par spécialité |
+| ![Hospitalisations de plus d'une nuit](docs/kpi5.png) | ![Chambres non occupées](docs/kpi6.png) |
+| **KPI 5** — Proportion d'hospitalisations de plus d'une nuit | **KPI 6** — Chambres non occupées sur une période |
+
+## Points techniques notables
+
+- **Idempotence** : l'installation (`SQL/install_sid.py`) peut être relancée sans risque (`CREATE … IF NOT EXISTS`).
+- **Historisation de STG** : avant chaque rechargement, le contenu de STG est exporté dans `HISTORY/`, avec une durée de rétention configurable.
+- **Reprise sur erreur** : un jour en échec est enregistré, puis retraité automatiquement au run suivant, sans bloquer les jours d'après.
+- **Exécution séquentielle** : `max_active_runs=1`, chaque jour est entièrement traité (validation → STG → dbt) avant le suivant.
+- **Traçabilité** : chaque modèle dbt écrit son début et sa fin dans TCH via des `pre_hook` / `post_hook`, avec l'`invocation_id` dbt comme identifiant d'exécution.
+- **Double environnement** : les mêmes scripts tournent en local (identifiants dans `profiles.yml`) ou dans un Workspace Snowflake (jeton OAuth détecté automatiquement).
 
 ---
 
-## 1. Installation de l'environnement
+## Équipe et contributions
+
+Projet réalisé à cinq : Etienne Vezien, Arthur Maugée, Mathieu Piekarz, Lewis Botokeky et Robin.
+
+**Ma contribution (Mathieu Piekarz)** :
+
+- **Ingestion des données** (`src/`) : chargement quotidien vers STG (PUT / COPY INTO), validation des fichiers sources, historisation et purge de STG, journalisation dans TCH, gestion et reprise des dates en échec ;
+- **Installation du SID** (`SQL/`) : scripts de création des bases, schémas, tables et du stage Snowflake, et script d'installation automatisé ;
+- **Orchestration** (`dags/`, `run_airflow.*`) : DAG Airflow du pipeline et de l'installation, scripts de lancement multiplateformes.
+
+La modélisation dbt (`dbt_hopital/`) et le tableau de bord Power BI (`PowerBI/`) ont principalement été réalisés par mes coéquipiers.
+
+---
+
+## Lancer le projet
+
+> **Données non incluses.** Les fichiers sources appartiennent au client et ne sont pas publiés. Pour exécuter le pipeline, placez vos dossiers `BDD_HOSPITAL_YYYYMMDD/` dans un répertoire de votre choix, puis indiquez-le via la variable `STG_DATA_DIR` ou l'option `--data-dir`.
+
+### Prérequis
+
+- [uv](https://docs.astral.sh/uv/) (gestionnaire d'environnement Python)
+- Un compte Snowflake avec le rôle `ACCOUNTADMIN`
+
+### 1. Environnement
 
 ```bash
 uv sync
-```
-
-Vérifier dbt :
-
-```bash
 uv run dbt --version
 ```
 
----
-
-## 2. Profil Snowflake (`dbt_hopital/profiles.yml`)
-
-Copier le template (ne jamais committer `profiles.yml`) :
-
-**Linux / macOS**
+### 2. Connexion Snowflake
 
 ```bash
 cp dbt_hopital/profiles.yml.example dbt_hopital/profiles.yml
 ```
 
-**Windows (PowerShell)**
+Renseignez `account`, `user` et `password` sous `outputs.local`. Ce fichier est ignoré par Git : ne le commitez jamais.
 
-```powershell
-Copy-Item dbt_hopital/profiles.yml.example dbt_hopital/profiles.yml
-```
-
-Éditer `dbt_hopital/profiles.yml` : renseigner `account`, `user`, `password` sous `outputs.local`.
-
-Dans le **Workspace Snowflake**, la cible `workspace` est sélectionnée automatiquement :
-- Les scripts Python (`install_sid.py`, `load_data.py`) lisent le token OAuth depuis `/snowflake/session/token` (fichier de session injecté par Snowflake) — aucune variable d'environnement à configurer.
-- `dbt run` utilise la valeur `token: "{{ env_var('SNOWFLAKE_OAUTH_TOKEN') }}"` définie dans `profiles.yml` — la variable `SNOWFLAKE_OAUTH_TOKEN` doit être présente dans l'environnement du Workspace.
-
----
-
-## 3. Installation du SID (bases + tables)
-
-Script idempotent (log : `logs/installation.log`).
-
-**Via Airflow (recommandé)** : démarrer Airflow (voir [§ 7](#7-airflow-orchestration)), puis déclencher manuellement le DAG `dag_install_sid` depuis l'UI (pas de schedule, trigger manuel uniquement).
-
-**En CLI** :
+### 3. Installation des bases et des tables
 
 ```bash
 uv run python SQL/install_sid.py
 ```
 
----
+Vous pouvez aussi déclencher le DAG `dag_install_sid` depuis l'interface Airflow.
 
-## 4. Chargement STG (un jour)
+### 4. Exécution du pipeline
 
-Charge les fichiers `.txt` d'une journée dans STG via PUT → COPY INTO. Le script crée le stage Snowflake automatiquement si besoin, historise STG dans `HISTORY/` avant de le tronquer, puis trace l'exécution dans TCH.
-
-**En CLI :**
+**Un jour, sans Airflow :**
 
 ```bash
-uv run python src/load_data.py --date 20260429
-```
-
-**Via Airflow :** le DAG `dag_run_pipeline` appelle `load_data` en interne — voir [§ 7](#7-airflow-orchestration).
-
-Arguments :
-
-- `--date YYYYMMDD` / `-d` — jour à charger (optionnel, défaut : `20260429`)
-- `--data-dir CHEMIN` — dossier parent contenant `BDD_HOSPITAL_YYYYMMDD/` (défaut : `STG_DATA_DIR` ou `Inputs_Projets_NF26_AI07/Data Hospital/`)
-- `--retention-days N` — rétention des snapshots dans `HISTORY/` (défaut : 2)
-- `--skip-history` — désactive le snapshot avant truncate
-
-Log : `logs/pipeline.log` (tronqué en exécution CLI ou trigger manuel Airflow ; append entre DagRuns d'un rattrapage)
-
----
-
-## 5. Transformations dbt
-
-dbt lit la connexion Snowflake depuis `dbt_hopital/profiles.yml` (même fichier que les scripts Python). Il transforme les données STG en deux couches :
-
-- **WRK** (`+materialized: table`) — recrée la table à chaque `dbt run` depuis STG
-- **SOC** (`+materialized: incremental`) — insère uniquement les nouvelles lignes, conserve l'historique
-
-Chaque model trace son exécution dans TCH via les macros `start_tracking` / `end_tracking` (utilise `invocation_id` comme `EXEC_ID`).
-
-**Tester la connexion :**
-
-```bash
-uv run dbt debug --project-dir dbt_hopital --profiles-dir dbt_hopital
-```
-
-**Lancer tous les modèles :**
-
-```bash
+uv run python src/load_data.py --date 20260429 --data-dir "/chemin/vers/Data Hospital"
 uv run dbt run --project-dir dbt_hopital --profiles-dir dbt_hopital
 ```
 
-**Lancer un seul modèle :**
+Options de `load_data.py` :
+
+| Option | Effet |
+|---|---|
+| `--date YYYYMMDD` | Jour à charger |
+| `--data-dir CHEMIN` | Dossier contenant les `BDD_HOSPITAL_YYYYMMDD/` |
+| `--retention-days N` | Nombre de jours d'historique STG conservés (défaut : 2) |
+| `--skip-history` | Ne pas historiser STG avant de le vider |
+
+**Avec Airflow** (une période complète) :
 
 ```bash
-uv run dbt run --project-dir dbt_hopital --profiles-dir dbt_hopital --select wrk_room
+./run_airflow.sh        # Linux / macOS
+.\run_airflow.ps1       # Windows (PowerShell)
 ```
 
-**Logs :** en CLI directe, dbt écrit sous `dbt_hopital/target/dbt_logs/`. Via le DAG ou `run_daily_pipeline`, la sortie est intégrée dans `logs/pipeline.log`.
+Ouvrez ensuite **http://127.0.0.1:8080**. Lancez le DAG `dag_run_pipeline` avec **Trigger** et renseignez `date_debut`, et éventuellement `date_fin` : chaque jour de la période est traité dans l'ordre.
 
----
-
-## 6. Pipeline journalier local (indépendant du DAG)
-
-[`src/run_daily_pipeline.py`](src/run_daily_pipeline.py) exécute **un jour** du pipeline sans Airflow. La date est fixée dans le code (`LOCAL_RUN_DATE`, défaut `20260429`).
-
-```bash
-uv run python src/run_daily_pipeline.py
-```
-
-Étapes :
-
-1. Valide `LOCAL_RUN_DATE` et la présence des fichiers `.txt` du jour
-2. Si fichiers absents → échec
-3. Sinon → load STG → `dbt run`
-
-Log : `logs/pipeline.log`
-
-Pour traiter un autre jour : modifier `LOCAL_RUN_DATE` dans `src/run_daily_pipeline.py`.
-
----
-
-## 7. Airflow (orchestration complète)
-
-Le DAG `dag_run_pipeline` tourne selon deux modes :
-
-**Mode normal (quotidien)** — `schedule=@daily`, `catchup=False`  
-Le DAG se déclenche automatiquement chaque nuit à minuit UTC. Il traite la journée courante en passant par le pipeline complet dans l'ordre :
-
-`resolve_dates` → `validate_date` → `ingestion_stg` → `dbt_run`
-
-Pour chaque jour : validation des fichiers sources → chargement STG → `dbt run`. STG est tronqué et rechargé avant chaque dbt run.
-
-**Mode rattrapage (plage de jours)**  
-Pour traiter plusieurs jours d'un coup, utiliser le rattrapage Airflow. Chaque jour génère un DagRun indépendant. Les DagRuns s'enchaînent **séquentiellement** (`max_active_runs=1`) : le jour J doit terminer entièrement (validation → STG → dbt) avant que le jour J+1 commence.
-
-**Reprise sur erreur**  
-Si le jour J échoue, il est enregistré dans `logs/pipeline_failed_dates.txt`. Au DagRun suivant (J+1), le DAG retraite d'abord les jours en échec avant de traiter J+1. Un échec de reprise ne bloque pas J+1.
-
-**Retry automatique** : 1 retry avec délai de 5 minutes (`retries=1, retry_delay=5min`).
-
-**Log applicatif** : `logs/pipeline.log` — tronqué au trigger manuel ou en mode quotidien ; chaque DagRun de rattrapage s'ajoute en append. Supprimer le fichier avant un nouveau rattrapage pour repartir à zéro.
-
-### Démarrer Airflow
-
-**Linux / macOS**
-
-```bash
-chmod +x run_airflow.sh scripts/check_airflow_ui.sh   # une fois
-./run_airflow.sh
-```
-
-**Windows (PowerShell)**
-
-```powershell
-.\run_airflow.ps1
-```
-
-Les scripts `run_airflow.*` configurent `AIRFLOW_HOME`, l'écoute sur `127.0.0.1:8080` et affichent l'URL au démarrage.
-
-**Alternative (toutes plateformes)**
-
-```bash
-export AIRFLOW_HOME="$(pwd)"
-export AIRFLOW__API__HOST="127.0.0.1"
-export AIRFLOW__API__PORT="8080"
-export AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS="true"
-export AIRFLOW__LOGGING__BASE_LOG_FOLDER="${AIRFLOW_HOME}/.airflow/logs"
-uv run airflow standalone
-```
-
-Interface web : **http://127.0.0.1:8080** (préférer `127.0.0.1` à `localhost`).
-
-### Déclencher le pipeline manuellement
-
-**Un seul jour**
-
-Depuis l'UI : ouvrir le DAG `dag_run_pipeline` → bouton **Trigger** → choisir **Single run** → renseigner la date métier à traiter (format `YYYY-MM-DD`).
-
-Depuis la CLI :
-
-```bash
-export AIRFLOW_HOME="$(pwd)"
-uv run airflow dags trigger dag_run_pipeline -l 2026-04-29
-```
-
-**Plusieurs jours**
-
-Depuis l'UI : ouvrir le DAG `dag_run_pipeline` → bouton **Trigger** → choisir **Backfill** → renseigner la date de début et la date de fin.
-
-Depuis la CLI :
-
-```bash
-export AIRFLOW_HOME="$(pwd)"
-
-# Vérification sans exécuter (dry-run)
-uv run airflow backfill create --dag-id dag_run_pipeline \
-  --from-date 2026-04-29 --to-date 2026-05-10 --dry-run
-
-# Exécution réelle (traite du 29/04 au 10/05 inclus)
-uv run airflow backfill create --dag-id dag_run_pipeline \
-  --from-date 2026-04-29 --to-date 2026-05-10 \
-  --reprocess-behavior none
-```
-
----
-
-## Variables d'environnement
+### Variables d'environnement
 
 | Variable | Usage |
-|----------|--------|
-| `STG_DATA_DIR` | Chemin vers le dossier `Data Hospital` (ex. `C:\data\Data Hospital` sur Windows) |
+|---|---|
+| `STG_DATA_DIR` | Dossier des fichiers sources |
+| `STG_HISTORY_RETENTION_DAYS` | Durée de rétention de l'historique STG |
 | `DBT_TARGET` | Forcer la cible dbt : `local` ou `workspace` |
-| `AIRFLOW_HOME` | Racine du dépôt (obligatoire pour Airflow ; défini par les scripts `run_airflow.*`) |
-| `STG_HISTORY_RETENTION_DAYS` | Rétention des snapshots STG dans `HISTORY/` |
+| `AIRFLOW_HOME` | Racine du dépôt (défini automatiquement par `run_airflow.*`) |
 
----
+Les journaux d'exécution sont écrits dans `logs/`.
 
-## Détail de l'arborescence
+## Arborescence
 
 ```
-Inputs_Projets_NF26_AI07/Data Hospital/BDD_HOSPITAL_YYYYMMDD/  ← fichiers sources (.txt)
-SQL/                    ← scripts de création des bases et tables (create_db, create_stg, create_soc, create_tch, create_stg_stage) + install_sid.py + snowflake_utils.py
-src/                    ← scripts Python du pipeline (load_data.py, pipeline_common.py, pipeline_failed_dates.py, run_daily_pipeline.py)
-dags/                   ← scripts DAG airflow (dag_run_pipeline.py, dag_install_sid.py)
-dbt_hopital/            ← projet dbt (models WRK + SOC, macros, profiles.yml)
-MPD/                    ← modèles de données STG et SOC 
-PowerBI/                ← création des vues SQL (create_views/), exports du contenu des vues en CSV (export_views/exports/), dashboard .pbix
-logs/                   ← fichiers de logs générés par l'ensemble des traitements du projet
+SQL/            Création des bases, schémas et tables Snowflake + script d'installation
+src/            Pipeline Python : chargement STG, suivi TCH, reprise des dates en échec
+dags/           DAG Airflow (pipeline et installation)
+dbt_hopital/    Projet dbt : modèles WRK et SOC, macros de traçabilité
+PowerBI/        Vues SQL des KPI et script d'export
+MPD/            Modèles physiques de données (STG, SOC)
+docs/           Captures du tableau de bord
 ```
-
-
